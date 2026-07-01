@@ -1,0 +1,5 @@
+sessions/
+*.db
+server
+*.env
+.env*
