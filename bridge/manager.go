@@ -78,7 +78,7 @@ func (m *Manager) openContainer(token string) (*sqlstore.Container, error) {
 	if err := os.MkdirAll(m.tokenDir(token), 0700); err != nil {
 		return nil, err
 	}
-	dsn := fmt.Sprintf("file:%s?_foreign_keys=on", m.sessionPath(token))
+	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)", m.sessionPath(token))
 	return sqlstore.New(context.Background(), "sqlite", dsn, waLog.Noop)
 }
 
