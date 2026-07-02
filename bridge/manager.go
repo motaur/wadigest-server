@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -86,17 +87,25 @@ func (m *Manager) openContainer(token string) (*sqlstore.Container, error) {
 // The channel is closed when pairing succeeds, fails, or times out.
 // Caller must hold the token (from a prior call) and pass it in.
 func (m *Manager) PairQR(ctx context.Context, token string) (<-chan PairEvent, error) {
+	// Held for the whole pairing lifetime (through the post-pair history
+	// wait below), so a Sync() call the frontend fires right after "success"
+	// can't open a second connection to the same session while this one is
+	// still finishing up.
+	unlock := m.lock(token)
+
 	// Blow away any stale session so whatsmeow gets fresh noise keys.
 	_ = os.RemoveAll(m.tokenDir(token))
 
 	container, err := m.openContainer(token)
 	if err != nil {
+		unlock()
 		return nil, err
 	}
 
 	device, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 
@@ -104,16 +113,20 @@ func (m *Manager) PairQR(ctx context.Context, token string) (<-chan PairEvent, e
 	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 	connected := waitForConnected(client)
+	historyDone := m.captureHistorySync(client, token)
 	if err := client.Connect(); err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 
 	out := make(chan PairEvent, 8)
 	go func() {
+		defer unlock()
 		defer close(out)
 		defer client.Disconnect()
 		defer container.Close()
@@ -123,7 +136,7 @@ func (m *Manager) PairQR(ctx context.Context, token string) (<-chan PairEvent, e
 				out <- PairEvent{Type: "qr", Payload: evt.Code}
 			case "success":
 				out <- PairEvent{Type: "success"}
-				awaitPostPairHandshake(connected)
+				awaitPostPairHandshake(connected, historyDone)
 				return
 			case "timeout":
 				out <- PairEvent{Type: "error", Payload: "qr_timeout"}
@@ -150,16 +163,45 @@ func waitForConnected(client *whatsmeow.Client) <-chan struct{} {
 	return connected
 }
 
+// captureHistorySync registers a handler that saves every history-sync batch
+// the phone sends after pairing into a per-token cache file (see
+// appendHistorySyncCache), and returns a channel that's closed once the
+// phone reports the sync is complete. Without this, the initial batch of
+// historical messages whatsmeow downloads right after pairing is delivered
+// exactly once and is lost forever if nothing consumes it.
+func (m *Manager) captureHistorySync(client *whatsmeow.Client, token string) <-chan struct{} {
+	done := make(chan struct{})
+	var closeOnce sync.Once
+	client.AddEventHandler(func(rawEvt interface{}) {
+		evt, ok := rawEvt.(*events.HistorySync)
+		if !ok || evt.Data == nil {
+			return
+		}
+		_ = m.appendHistorySyncCache(token, parseHistorySync(client, evt.Data))
+		if evt.Data.GetProgress() >= 100 {
+			closeOnce.Do(func() { close(done) })
+		}
+	})
+	return done
+}
+
 // awaitPostPairHandshake gives whatsmeow time to finish the post-pairing
 // handshake before the caller disconnects. Disconnecting right after
 // PairSuccess — before the client reaches "Connected" — leaves the phone's
 // WhatsApp app stuck on "Logging in..." and then reports a link failure.
-func awaitPostPairHandshake(connected <-chan struct{}) {
+// It then waits for the phone to finish sending historical messages (see
+// captureHistorySync), since that only happens once per pairing.
+func awaitPostPairHandshake(connected, historyDone <-chan struct{}) {
 	select {
 	case <-connected:
-		time.Sleep(2 * time.Second)
 	case <-time.After(10 * time.Second):
+		return
 	}
+	select {
+	case <-historyDone:
+	case <-time.After(15 * time.Second):
+	}
+	time.Sleep(2 * time.Second)
 }
 
 // qrEventMessage turns any non-code/success/timeout QRChannelItem into a
@@ -172,19 +214,115 @@ func qrEventMessage(evt whatsmeow.QRChannelItem) string {
 	return evt.Event
 }
 
+// buildMessage converts a whatsmeow message event — live or parsed out of a
+// history-sync batch — into our Message type. ok is false for events with
+// no extractable text (reactions, receipts, protocol messages, etc.).
+func buildMessage(v *events.Message, groupNames map[types.JID]string) (msg Message, ok bool) {
+	text := extractText(v)
+	if text == "" {
+		return Message{}, false
+	}
+	chatName := v.Info.PushName
+	if v.Info.IsGroup {
+		chatName = groupNames[v.Info.Chat]
+	}
+	return Message{
+		ChatJID:   v.Info.Chat.String(),
+		ChatName:  chatName,
+		Sender:    v.Info.PushName,
+		IsFromMe:  v.Info.IsFromMe,
+		Text:      text,
+		Timestamp: v.Info.Timestamp.UnixMilli(),
+		IsGroup:   v.Info.IsGroup,
+	}, true
+}
+
+// parseHistorySync converts a decoded history-sync blob into our Message
+// type. Conversation names come from the blob itself (GetJoinedGroups isn't
+// available yet this early in the pairing flow).
+func parseHistorySync(client *whatsmeow.Client, data *waHistorySync.HistorySync) []Message {
+	var out []Message
+	groupNames := make(map[types.JID]string)
+	for _, conv := range data.GetConversations() {
+		chatJID, err := types.ParseJID(conv.GetID())
+		if err != nil {
+			continue
+		}
+		if name := conv.GetName(); name != "" {
+			groupNames[chatJID] = name
+		}
+		for _, hm := range conv.GetMessages() {
+			webMsg := hm.GetMessage()
+			if webMsg == nil {
+				continue
+			}
+			evt, err := client.ParseWebMessage(chatJID, webMsg)
+			if err != nil {
+				continue
+			}
+			if msg, ok := buildMessage(evt, groupNames); ok {
+				out = append(out, msg)
+			}
+		}
+	}
+	return out
+}
+
+func (m *Manager) historySyncCachePath(token string) string {
+	return fmt.Sprintf("%s/history_sync.json", m.tokenDir(token))
+}
+
+// appendHistorySyncCache persists messages from a history-sync batch to
+// disk. The pairing websocket only streams PairEvents to the client, so
+// this is how the messages survive until the next Sync() call picks them up.
+func (m *Manager) appendHistorySyncCache(token string, msgs []Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	path := m.historySyncCachePath(token)
+	var existing []Message
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &existing)
+	}
+	data, err := json.Marshal(append(existing, msgs...))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
+}
+
+// consumeHistorySyncCache reads and deletes the cached history-sync messages
+// for token, if any were saved during pairing.
+func (m *Manager) consumeHistorySyncCache(token string) []Message {
+	path := m.historySyncCachePath(token)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	os.Remove(path)
+	var msgs []Message
+	_ = json.Unmarshal(data, &msgs)
+	return msgs
+}
+
 // PairPhone starts phone-number pairing. The pairing code is sent as a
 // PairEvent{Type:"code"}, then success/error follow.
 func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan PairEvent, error) {
+	// See PairQR for why this is held through the post-pair history wait.
+	unlock := m.lock(token)
+
 	_ = os.RemoveAll(m.tokenDir(token))
 
 	container, err := m.openContainer(token)
 	if err != nil {
+		unlock()
 		return nil, err
 	}
 
 	device, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 
@@ -192,11 +330,14 @@ func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan Pa
 	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 	connected := waitForConnected(client)
+	historyDone := m.captureHistorySync(client, token)
 	if err := client.Connect(); err != nil {
 		container.Close()
+		unlock()
 		return nil, err
 	}
 
@@ -213,6 +354,7 @@ func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan Pa
 	}()
 
 	go func() {
+		defer unlock()
 		defer close(out)
 		defer client.Disconnect()
 		defer container.Close()
@@ -223,7 +365,7 @@ func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan Pa
 				// pairing; irrelevant here since we're pairing via code.
 			case "success":
 				out <- PairEvent{Type: "success"}
-				awaitPostPairHandshake(connected)
+				awaitPostPairHandshake(connected, historyDone)
 				return
 			case "timeout":
 				out <- PairEvent{Type: "error", Payload: "pair_timeout"}
@@ -266,28 +408,10 @@ func (m *Manager) Sync(token string, waitSeconds int) (SyncResult, error) {
 	client.AddEventHandler(func(rawEvt interface{}) {
 		switch v := rawEvt.(type) {
 		case *events.Message:
-			text := extractText(v)
-			if text == "" {
-				return
-			}
 			mu.Lock()
-			chatName := v.Info.PushName
-			if v.Info.IsGroup {
-				if n, ok := groupNames[v.Info.Chat]; ok {
-					chatName = n
-				} else {
-					chatName = ""
-				}
+			if msg, ok := buildMessage(v, groupNames); ok {
+				messages = append(messages, msg)
 			}
-			messages = append(messages, Message{
-				ChatJID:   v.Info.Chat.String(),
-				ChatName:  chatName,
-				Sender:    v.Info.PushName,
-				IsFromMe:  v.Info.IsFromMe,
-				Text:      text,
-				Timestamp: v.Info.Timestamp.UnixMilli(),
-				IsGroup:   v.Info.IsGroup,
-			})
 			mu.Unlock()
 		case *events.GroupInfo:
 			if v.Name != nil && v.Name.Name != "" {
@@ -295,6 +419,17 @@ func (m *Manager) Sync(token string, waitSeconds int) (SyncResult, error) {
 				groupNames[v.JID] = v.Name.Name
 				mu.Unlock()
 			}
+		case *events.HistorySync:
+			// Rare here (the initial batch normally arrives during pairing
+			// and is cached — see captureHistorySync), but handle it in case
+			// the phone sends another batch during a later sync.
+			if v.Data == nil {
+				return
+			}
+			historyMsgs := parseHistorySync(client, v.Data)
+			mu.Lock()
+			messages = append(messages, historyMsgs...)
+			mu.Unlock()
 		}
 	})
 
@@ -317,8 +452,13 @@ func (m *Manager) Sync(token string, waitSeconds int) (SyncResult, error) {
 
 	time.Sleep(time.Duration(waitSeconds) * time.Second)
 
-	// Patch chat names that arrived before GetJoinedGroups returned.
 	mu.Lock()
+	// Historical messages the phone delivered right after pairing (see
+	// captureHistorySync) — the pairing websocket has no way to stream them
+	// straight to the client, so they wait here until the first sync.
+	messages = append(messages, m.consumeHistorySyncCache(token)...)
+
+	// Patch chat names that arrived before GetJoinedGroups returned.
 	for i := range messages {
 		if messages[i].IsGroup && messages[i].ChatName == "" {
 			var jid types.JID
