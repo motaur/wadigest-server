@@ -106,6 +106,7 @@ func (m *Manager) PairQR(ctx context.Context, token string) (<-chan PairEvent, e
 		container.Close()
 		return nil, err
 	}
+	connected := waitForConnected(client)
 	if err := client.Connect(); err != nil {
 		container.Close()
 		return nil, err
@@ -122,14 +123,53 @@ func (m *Manager) PairQR(ctx context.Context, token string) (<-chan PairEvent, e
 				out <- PairEvent{Type: "qr", Payload: evt.Code}
 			case "success":
 				out <- PairEvent{Type: "success"}
+				awaitPostPairHandshake(connected)
 				return
 			case "timeout":
 				out <- PairEvent{Type: "error", Payload: "qr_timeout"}
+				return
+			default:
+				out <- PairEvent{Type: "error", Payload: qrEventMessage(evt)}
 				return
 			}
 		}
 	}()
 	return out, nil
+}
+
+// waitForConnected registers a handler that reports once the client reaches
+// the "Connected" state, and must be called before client.Connect().
+func waitForConnected(client *whatsmeow.Client) <-chan struct{} {
+	connected := make(chan struct{})
+	var closeOnce sync.Once
+	client.AddEventHandler(func(rawEvt interface{}) {
+		if _, ok := rawEvt.(*events.Connected); ok {
+			closeOnce.Do(func() { close(connected) })
+		}
+	})
+	return connected
+}
+
+// awaitPostPairHandshake gives whatsmeow time to finish the post-pairing
+// handshake before the caller disconnects. Disconnecting right after
+// PairSuccess — before the client reaches "Connected" — leaves the phone's
+// WhatsApp app stuck on "Logging in..." and then reports a link failure.
+func awaitPostPairHandshake(connected <-chan struct{}) {
+	select {
+	case <-connected:
+		time.Sleep(2 * time.Second)
+	case <-time.After(10 * time.Second):
+	}
+}
+
+// qrEventMessage turns any non-code/success/timeout QRChannelItem into a
+// human-readable error string, so pairing failures (e.g. a stale QR getting
+// scanned) reach the client instead of the socket closing silently.
+func qrEventMessage(evt whatsmeow.QRChannelItem) string {
+	if evt.Error != nil {
+		return evt.Error.Error()
+	}
+	return evt.Event
 }
 
 // PairPhone starts phone-number pairing. The pairing code is sent as a
@@ -154,6 +194,7 @@ func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan Pa
 		container.Close()
 		return nil, err
 	}
+	connected := waitForConnected(client)
 	if err := client.Connect(); err != nil {
 		container.Close()
 		return nil, err
@@ -177,11 +218,18 @@ func (m *Manager) PairPhone(ctx context.Context, token, phone string) (<-chan Pa
 		defer container.Close()
 		for evt := range qrChan {
 			switch evt.Event {
+			case "code":
+				// QR codes are still emitted on this channel during phone
+				// pairing; irrelevant here since we're pairing via code.
 			case "success":
 				out <- PairEvent{Type: "success"}
+				awaitPostPairHandshake(connected)
 				return
 			case "timeout":
 				out <- PairEvent{Type: "error", Payload: "pair_timeout"}
+				return
+			default:
+				out <- PairEvent{Type: "error", Payload: qrEventMessage(evt)}
 				return
 			}
 		}
